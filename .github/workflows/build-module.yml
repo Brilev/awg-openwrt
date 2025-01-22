@@ -3,7 +3,9 @@ name: Create Release on Tag
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v21.0.2"
+    pkgarch:
+      - 
   workflow_call:
     inputs:
       tag_name:
