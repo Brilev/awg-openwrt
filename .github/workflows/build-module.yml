@@ -3,7 +3,7 @@ name: Create Release on Tag
 on:
   push:
     tags:
-      - "v24.11.11"
+      - "v*.*.*"
     pkgarch:
       - 
   workflow_call:
