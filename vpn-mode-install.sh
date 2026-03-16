@@ -1,313 +1,417 @@
 #!/bin/sh
-#set -x
 
-APP_NAME="vpn-mode-switch"
+set -e
+
 CONFIG_NAME="vpnmode"
 CONFIG_SECTION="settings"
-SCRIPT_APPLY="/usr/bin/vpn-mode-apply"
-LUA_CONTROLLER="/usr/lib/lua/luci/controller/vpnmode.lua"
-LUA_CBI="/usr/lib/lua/luci/model/cbi/vpnmode.lua"
+
+APPLY_SCRIPT="/usr/bin/vpn-mode-apply"
+VIEW_DIR="/www/luci-static/resources/view/network"
+VIEW_FILE="$VIEW_DIR/vpnmode.js"
+MENU_DIR="/usr/share/luci/menu.d"
+MENU_FILE="$MENU_DIR/vpnmode.json"
+ACL_DIR="/usr/share/rpcd/acl.d"
+ACL_FILE="$ACL_DIR/luci-app-vpnmode.json"
 
 green() {
-    printf "\033[32;1m%s\033[0m\n" "$1"
+	printf "\033[32;1m%s\033[0m\n" "$1"
+}
+
+yellow() {
+	printf "\033[33;1m%s\033[0m\n" "$1"
 }
 
 red() {
-    printf "\033[31;1m%s\033[0m\n" "$1"
+	printf "\033[31;1m%s\033[0m\n" "$1"
 }
 
-check_requirements() {
-    green "Checking required interfaces and peers..."
+require_interface() {
+	local ifname="$1"
 
-    if ! uci -q get network.awg0 >/dev/null 2>&1; then
-        red "Interface network.awg0 not found. First configure domain-routing-openwrt with AWG."
-        exit 1
-    fi
-
-    if ! uci -q get network.awg1 >/dev/null 2>&1; then
-        red "Interface network.awg1 not found. First configure Brilev/awg-openwrt."
-        exit 1
-    fi
-
-    if ! uci show network | grep -q "amneziawg_awg0"; then
-        red "Peer section amneziawg_awg0 not found."
-        exit 1
-    fi
-
-    if ! uci show network | grep -q "amneziawg_awg1"; then
-        red "Peer section amneziawg_awg1 not found."
-        exit 1
-    fi
+	if ! uci -q get "network.$ifname" >/dev/null 2>&1; then
+		red "Required interface network.$ifname not found"
+		exit 1
+	fi
 }
 
-ensure_firewall_zone() {
-    local zone_name="$1"
-    local ifname="$2"
+require_peer_section() {
+	local section="$1"
 
-    if uci show firewall | grep -q "@zone.*name='$zone_name'"; then
-        green "Firewall zone $zone_name already exists"
-    else
-        green "Creating firewall zone $zone_name"
-        uci add firewall zone
-        uci set firewall.@zone[-1].name="$zone_name"
-        uci set firewall.@zone[-1].network="$ifname"
-        uci set firewall.@zone[-1].forward='REJECT'
-        uci set firewall.@zone[-1].output='ACCEPT'
-        uci set firewall.@zone[-1].input='REJECT'
-        uci set firewall.@zone[-1].masq='1'
-        uci set firewall.@zone[-1].mtu_fix='1'
-        uci set firewall.@zone[-1].family='ipv4'
-    fi
-}
-
-ensure_forwarding() {
-    local src="$1"
-    local dest="$2"
-    local name="$3"
-
-    if uci show firewall | grep -q "@forwarding.*name='$name'"; then
-        green "Forwarding $name already exists"
-    else
-        green "Creating forwarding $name"
-        uci add firewall forwarding
-        uci set firewall.@forwarding[-1]=forwarding
-        uci set firewall.@forwarding[-1].name="$name"
-        uci set firewall.@forwarding[-1].src="$src"
-        uci set firewall.@forwarding[-1].dest="$dest"
-        uci set firewall.@forwarding[-1].family='ipv4'
-    fi
+	if ! uci -q get "network.$section" >/dev/null 2>&1; then
+		red "Required peer section network.$section not found"
+		exit 1
+	fi
 }
 
 ensure_mode_config() {
-    green "Creating /etc/config/$CONFIG_NAME"
-    uci -q batch <<-EOF
-        set $CONFIG_NAME.$CONFIG_SECTION=main
-        set $CONFIG_NAME.$CONFIG_SECTION.mode='domain'
-        commit $CONFIG_NAME
-EOF
+	green "Ensuring /etc/config/$CONFIG_NAME"
+
+	if ! uci -q get "$CONFIG_NAME.$CONFIG_SECTION" >/dev/null 2>&1; then
+		uci set "$CONFIG_NAME.$CONFIG_SECTION=main"
+	fi
+
+	uci set "$CONFIG_NAME.$CONFIG_SECTION.mode=domain"
+	uci commit "$CONFIG_NAME"
+}
+
+find_zone_by_name() {
+	local name="$1"
+	local sec
+
+	for sec in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)=zone/\1/p"); do
+		[ "$(uci -q get firewall.$sec.name)" = "$name" ] && {
+			echo "$sec"
+			return 0
+		}
+	done
+
+	return 1
+}
+
+ensure_firewall_zone() {
+	local zone_name="$1"
+	local ifname="$2"
+	local sec
+
+	if sec="$(find_zone_by_name "$zone_name")"; then
+		green "Firewall zone $zone_name already exists"
+		uci set "firewall.$sec.network=$ifname"
+		uci set "firewall.$sec.input=REJECT"
+		uci set "firewall.$sec.output=ACCEPT"
+		uci set "firewall.$sec.forward=REJECT"
+		uci set "firewall.$sec.masq=1"
+		uci set "firewall.$sec.mtu_fix=1"
+		uci set "firewall.$sec.family=ipv4"
+	else
+		green "Creating firewall zone $zone_name"
+		sec="$(uci add firewall zone)"
+		uci set "firewall.$sec.name=$zone_name"
+		uci set "firewall.$sec.network=$ifname"
+		uci set "firewall.$sec.input=REJECT"
+		uci set "firewall.$sec.output=ACCEPT"
+		uci set "firewall.$sec.forward=REJECT"
+		uci set "firewall.$sec.masq=1"
+		uci set "firewall.$sec.mtu_fix=1"
+		uci set "firewall.$sec.family=ipv4"
+	fi
+}
+
+find_forwarding_by_src_dest() {
+	local src="$1"
+	local dest="$2"
+	local sec
+
+	for sec in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)=forwarding/\1/p"); do
+		[ "$(uci -q get firewall.$sec.src)" = "$src" ] || continue
+		[ "$(uci -q get firewall.$sec.dest)" = "$dest" ] || continue
+		echo "$sec"
+		return 0
+	done
+
+	return 1
+}
+
+ensure_forwarding() {
+	local src="$1"
+	local dest="$2"
+	local name="$3"
+	local sec
+
+	if sec="$(find_forwarding_by_src_dest "$src" "$dest")"; then
+		green "Forwarding $src -> $dest already exists"
+		uci set "firewall.$sec.name=$name"
+		uci set "firewall.$sec.family=ipv4"
+	else
+		green "Creating forwarding $src -> $dest"
+		sec="$(uci add firewall forwarding)"
+		uci set "firewall.$sec.name=$name"
+		uci set "firewall.$sec.src=$src"
+		uci set "firewall.$sec.dest=$dest"
+		uci set "firewall.$sec.family=ipv4"
+	fi
+}
+
+ensure_forwardings() {
+	green "Ensuring forwardings"
+	ensure_forwarding "lan" "wan"  "lan-wan"
+	ensure_forwarding "lan" "awg0" "awg0-lan"
+	ensure_forwarding "lan" "awg1" "awg1-lan"
+	uci commit firewall
 }
 
 install_apply_script() {
-    green "Installing $SCRIPT_APPLY"
+	green "Installing $APPLY_SCRIPT"
 
-    cat > "$SCRIPT_APPLY" <<'EOF'
+	cat > "$APPLY_SCRIPT" <<'EOF'
 #!/bin/sh
-#set -x
+
+set -e
 
 MODE="$(uci -q get vpnmode.settings.mode || echo domain)"
 
-log() {
-    logger -t vpnmode "$*"
+find_forwarding_by_name() {
+	local name="$1"
+	local sec
+
+	for sec in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)=forwarding/\1/p"); do
+		[ "$(uci -q get firewall.$sec.name)" = "$name" ] && {
+			echo "$sec"
+			return 0
+		}
+	done
+
+	return 1
 }
 
 set_forwarding_enabled_by_name() {
-    local name="$1"
-    local enabled="$2"
-    local sec
+	local name="$1"
+	local enabled="$2"
+	local sec
 
-    sec="$(uci show firewall | sed -n "s/^firewall\.\([^.=]*\)=forwarding/\1/p" | while read -r s; do
-        [ "$(uci -q get firewall.$s.name)" = "$name" ] && echo "$s" && break
-    done)"
+	if ! sec="$(find_forwarding_by_name "$name")"; then
+		return 0
+	fi
 
-    [ -n "$sec" ] || return 0
-
-    if [ "$enabled" = "1" ]; then
-        uci -q delete firewall."$sec".enabled || true
-    else
-        uci set firewall."$sec".enabled='0'
-    fi
+	if [ "$enabled" = "1" ]; then
+		uci -q delete "firewall.$sec.enabled" || true
+	else
+		uci set "firewall.$sec.enabled=0"
+	fi
 }
 
 set_service_state() {
-    local svc="$1"
-    local enabled="$2"
+	local svc="$1"
+	local enabled="$2"
 
-    [ -x "/etc/init.d/$svc" ] || return 0
+	[ -x "/etc/init.d/$svc" ] || return 0
 
-    if [ "$enabled" = "1" ]; then
-        /etc/init.d/"$svc" enable || true
-        /etc/init.d/"$svc" restart || /etc/init.d/"$svc" start || true
-    else
-        /etc/init.d/"$svc" disable || true
-        /etc/init.d/"$svc" stop || true
-    fi
+	if [ "$enabled" = "1" ]; then
+		/etc/init.d/"$svc" enable || true
+		/etc/init.d/"$svc" restart || /etc/init.d/"$svc" start || true
+	else
+		/etc/init.d/"$svc" disable || true
+		/etc/init.d/"$svc" stop || true
+	fi
 }
 
 apply_mode() {
-    case "$MODE" in
-        full)
-            # lan -> awg1
-            set_forwarding_enabled_by_name "lan-wan" 0
-            set_forwarding_enabled_by_name "awg0-lan" 0
-            set_forwarding_enabled_by_name "awg1-lan" 1
+	case "$MODE" in
+		full)
+			set_forwarding_enabled_by_name "lan-wan" 0
+			set_forwarding_enabled_by_name "awg0-lan" 0
+			set_forwarding_enabled_by_name "awg1-lan" 1
 
-            # awg1 full tunnel on
-            uci set network.@amneziawg_awg1[0].route_allowed_ips='1'
+			uci set network.@amneziawg_awg1[0].route_allowed_ips='1'
+			uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
 
-            # awg0 domain-routing peer stays without default route
-            uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
+			set_service_state getdomains 0
+		;;
 
-            # domain list updater off
-            set_service_state getdomains 0
-        ;;
+		domain)
+			set_forwarding_enabled_by_name "lan-wan" 1
+			set_forwarding_enabled_by_name "awg0-lan" 1
+			set_forwarding_enabled_by_name "awg1-lan" 0
 
-        domain)
-            # lan -> wan + awg0
-            set_forwarding_enabled_by_name "lan-wan" 1
-            set_forwarding_enabled_by_name "awg0-lan" 1
-            set_forwarding_enabled_by_name "awg1-lan" 0
+			uci set network.@amneziawg_awg1[0].route_allowed_ips='0'
+			uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
 
-            # no default route through awg1
-            uci set network.@amneziawg_awg1[0].route_allowed_ips='0'
-            uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
+			set_service_state getdomains 1
+		;;
 
-            # domain list updater on
-            set_service_state getdomains 1
-        ;;
+		off)
+			set_forwarding_enabled_by_name "lan-wan" 1
+			set_forwarding_enabled_by_name "awg0-lan" 0
+			set_forwarding_enabled_by_name "awg1-lan" 0
 
-        off)
-            # only plain internet
-            set_forwarding_enabled_by_name "lan-wan" 1
-            set_forwarding_enabled_by_name "awg0-lan" 0
-            set_forwarding_enabled_by_name "awg1-lan" 0
+			uci set network.@amneziawg_awg1[0].route_allowed_ips='0'
+			uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
 
-            uci set network.@amneziawg_awg1[0].route_allowed_ips='0'
-            uci set network.@amneziawg_awg0[0].route_allowed_ips='0'
+			set_service_state getdomains 0
+		;;
 
-            set_service_state getdomains 0
-        ;;
+		*)
+			logger -t vpnmode "Unknown mode: $MODE"
+			exit 1
+		;;
+	esac
 
-        *)
-            log "Unknown mode: $MODE"
-            exit 1
-        ;;
-    esac
+	uci commit firewall
+	uci commit network
 
-    uci commit firewall
-    uci commit network
+	/etc/init.d/firewall restart
+	/etc/init.d/network restart
 
-    /etc/init.d/firewall restart
-    /etc/init.d/network restart
-
-    log "Applied mode: $MODE"
-    exit 0
+	logger -t vpnmode "Applied mode: $MODE"
 }
 
 apply_mode
 EOF
 
-    chmod +x "$SCRIPT_APPLY"
+	chmod +x "$APPLY_SCRIPT"
 }
 
-install_luci_controller() {
-    green "Installing LuCI controller"
+install_js_view() {
+	green "Installing JS view"
+	mkdir -p "$VIEW_DIR"
 
-    mkdir -p /usr/lib/lua/luci/controller
+	cat > "$VIEW_FILE" <<'EOF'
+'use strict';
+'require view';
+'require form';
+'require uci';
+'require fs';
+'require ui';
 
-    cat > "$LUA_CONTROLLER" <<'EOF'
-module("luci.controller.vpnmode", package.seeall)
+return view.extend({
+	load: function() {
+		return uci.load('vpnmode');
+	},
 
-function index()
-    if not nixio.fs.access("/etc/config/vpnmode") then
-        return
-    end
+	render: function() {
+		var m, s, o;
 
-    entry({"admin", "network", "vpnmode"}, cbi("vpnmode"), _("VPN Mode"), 90)
-end
+		m = new form.Map('vpnmode', _('VPN Mode'),
+			_('Переключение между режимами awg0 / awg1 без Lua runtime.'));
+
+		s = m.section(form.NamedSection, 'settings', 'main');
+		s.anonymous = true;
+
+		o = s.option(form.ListValue, 'mode', _('Mode'));
+		o.value('off', _('Off'));
+		o.value('domain', _('Domain routing via awg0'));
+		o.value('full', _('Full tunnel via awg1'));
+		o.default = 'domain';
+		o.rmempty = false;
+
+		this.map = m;
+		return m.render();
+	},
+
+	handleSave: function(ev) {
+		return this.map.save();
+	},
+
+	handleSaveApply: function(ev) {
+		var self = this;
+
+		return self.map.save()
+			.then(function() {
+				return fs.exec('/usr/bin/vpn-mode-apply', []);
+			})
+			.then(function(res) {
+				if (res.code === 0) {
+					ui.addNotification(null, E('p', _('VPN mode applied successfully.')));
+				} else {
+					ui.addNotification(null, E('p', _('vpn-mode-apply returned non-zero exit code: %d').format(res.code)), 'danger');
+				}
+			})
+			.catch(function(err) {
+				ui.addNotification(null, E('p', _('Failed to apply VPN mode: %s').format(err)), 'danger');
+			});
+	},
+
+	handleReset: function(ev) {
+		return this.map.reset();
+	}
+});
 EOF
 }
 
-install_luci_cbi() {
-    green "Installing LuCI CBI model"
+install_menu_json() {
+	green "Installing menu JSON"
+	mkdir -p "$MENU_DIR"
 
-    mkdir -p /usr/lib/lua/luci/model/cbi
-
-    cat > "$LUA_CBI" <<'EOF'
-local sys = require "luci.sys"
-
-m = Map("vpnmode", "VPN Mode", "Режим переключения между awg0 и awg1")
-
-s = m:section(TypedSection, "main", "")
-s.anonymous = true
-
-mode = s:option(ListValue, "mode", "Mode")
-mode:value("off", "Off")
-mode:value("domain", "Domain routing via awg0")
-mode:value("full", "Full tunnel via awg1")
-mode.default = "domain"
-
-function m.on_after_commit(self)
-    sys.call("/usr/bin/vpn-mode-apply >/tmp/vpn-mode-apply.log 2>&1")
-end
-
-return m
+	cat > "$MENU_FILE" <<'EOF'
+{
+  "admin/network/vpnmode": {
+    "title": "VPN Mode",
+    "order": 95,
+    "depends": {
+      "acl": [ "luci-app-vpnmode" ]
+    },
+    "action": {
+      "type": "view",
+      "path": "network/vpnmode"
+    }
+  }
+}
 EOF
 }
 
-ensure_named_forwardings() {
-    green "Ensuring forwarding entries"
+install_acl_json() {
+	green "Installing ACL JSON"
+	mkdir -p "$ACL_DIR"
 
-    # stock forwarding lan -> wan often exists without name
-    local lan_wan_sec
-    lan_wan_sec="$(uci show firewall | sed -n "s/^firewall\.\([^.=]*\)=forwarding/\1/p" | while read -r s; do
-        [ "$(uci -q get firewall.$s.src)" = "lan" ] || continue
-        [ "$(uci -q get firewall.$s.dest)" = "wan" ] || continue
-        echo "$s"
-        break
-    done)"
+	cat > "$ACL_FILE" <<'EOF'
+{
+  "luci-app-vpnmode": {
+    "description": "Grant access to VPN Mode configuration",
+    "read": {
+      "uci": [ "vpnmode", "network", "firewall" ],
+      "file": {
+        "exec": [ "/usr/bin/vpn-mode-apply" ]
+      }
+    },
+    "write": {
+      "uci": [ "vpnmode", "network", "firewall" ],
+      "file": {
+        "exec": [ "/usr/bin/vpn-mode-apply" ]
+      }
+    }
+  }
+}
+EOF
+}
 
-    if [ -n "$lan_wan_sec" ]; then
-        if [ "$(uci -q get firewall.$lan_wan_sec.name)" != "lan-wan" ]; then
-            uci set firewall."$lan_wan_sec".name='lan-wan'
-        fi
-    else
-        uci add firewall forwarding
-        uci set firewall.@forwarding[-1]=forwarding
-        uci set firewall.@forwarding[-1].name='lan-wan'
-        uci set firewall.@forwarding[-1].src='lan'
-        uci set firewall.@forwarding[-1].dest='wan'
-        uci set firewall.@forwarding[-1].family='ipv4'
-    fi
-
-    ensure_forwarding "lan" "awg0" "awg0-lan"
-    ensure_forwarding "lan" "awg1" "awg1-lan"
-
-    uci commit firewall
+remove_legacy_lua() {
+	green "Removing legacy Lua LuCI files if present"
+	rm -f /usr/lib/lua/luci/controller/vpnmode.lua
+	rm -f /usr/lib/lua/luci/model/cbi/vpnmode.lua
 }
 
 restart_services() {
-    green "Restarting LuCI and firewall/network"
-    /etc/init.d/uhttpd restart
-    /etc/init.d/firewall restart
-    /etc/init.d/network restart
+	green "Restarting rpcd and uhttpd"
+	rm -rf /tmp/luci-*
+	/etc/init.d/rpcd restart
+	/etc/init.d/uhttpd restart
 }
 
-show_result() {
-    green "Installed successfully"
-    echo
-    echo "LuCI menu:"
-    echo "  Network -> VPN Mode"
-    echo
-    echo "Modes:"
-    echo "  off    - only lan -> wan"
-    echo "  domain - lan -> wan + awg0, getdomains enabled"
-    echo "  full   - lan -> awg1, awg1 route_allowed_ips=1"
-    echo
-    echo "Manual apply command:"
-    echo "  /usr/bin/vpn-mode-apply"
+apply_default_mode() {
+	green "Applying default mode"
+	"$APPLY_SCRIPT"
 }
 
 main() {
-    check_requirements
-    ensure_firewall_zone "awg0" "awg0"
-    ensure_firewall_zone "awg1" "awg1"
-    ensure_named_forwardings
-    ensure_mode_config
-    install_apply_script
-    install_luci_controller
-    install_luci_cbi
-    restart_services
-    show_result
+	require_interface "awg0"
+	require_interface "awg1"
+	require_peer_section "@amneziawg_awg0[0]"
+	require_peer_section "@amneziawg_awg1[0]"
+
+	ensure_mode_config
+	ensure_firewall_zone "awg0" "awg0"
+	ensure_firewall_zone "awg1" "awg1"
+	ensure_forwardings
+
+	install_apply_script
+	install_js_view
+	install_menu_json
+	install_acl_json
+	remove_legacy_lua
+
+	uci commit firewall
+	uci commit network
+
+	restart_services
+	apply_default_mode
+
+	green "Done"
+	echo
+	echo "Open LuCI: Network -> VPN Mode"
+	echo
+	echo "Modes:"
+	echo "  off    - lan -> wan only"
+	echo "  domain - lan -> wan + awg0, getdomains enabled"
+	echo "  full   - lan -> awg1, route_allowed_ips on awg1 enabled"
 }
 
-main
+main "$@"
