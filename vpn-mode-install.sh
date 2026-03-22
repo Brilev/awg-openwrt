@@ -1,6 +1,10 @@
 #!/bin/sh
 
 set -e
+echo "OpenWrt version:"
+cat /etc/openwrt_release
+echo "Detected firewall:"
+uci get firewall.@defaults[0].forward
 
 CONFIG_NAME="vpnmode"
 CONFIG_SECTION="settings"
@@ -16,6 +20,7 @@ MENU_FILE="$MENU_DIR/vpnmode.json"
 
 ACL_DIR="/usr/share/rpcd/acl.d"
 ACL_FILE="$ACL_DIR/luci-app-vpnmode.json"
+
 
 green() {
 	printf "\033[32;1m%s\033[0m\n" "$1"
