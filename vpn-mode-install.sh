@@ -61,20 +61,6 @@ ensure_mode_config() {
 	uci commit "$CONFIG_NAME"
 }
 
-find_zone_by_name() {
-	local name="$1"
-	local sec
-
-	for sec in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)=zone/\1/p"); do
-		[ "$(uci -q get firewall.$sec.name)" = "$name" ] && {
-			echo "$sec"
-			return 0
-		}
-	done
-
-	return 1
-}
-
 find_zone_by_network() {
 	local net="$1"
 	local sec networks
@@ -424,7 +410,7 @@ restart_luci() {
 	/etc/init.d/uhttpd restart
 }
 
-apply_default_mode() {
+apply_current_mode() {
 	green "Applying current/default VPN mode"
 	"$APPLY_SCRIPT"
 }
@@ -465,7 +451,7 @@ main() {
 	remove_legacy_lua
 
 	restart_luci
-	apply_default_mode
+	apply_current_mode
 
 	green "Done"
 	echo
